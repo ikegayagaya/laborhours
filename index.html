@@ -8,7 +8,7 @@
     <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
     <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
     <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/jsQR/1.4.0/jsQR.min.js"></script>
+    <script src="https://unpkg.com/jsqr@1.4.0/dist/jsQR.js"></script>
     <script src="製造ラインマスタ.js"></script>
 </head>
 <body>
@@ -85,12 +85,26 @@
             const processOptions = ['充填', '包装'];
 
             useEffect(() => {
-                if (window.jsQR) {
-                    jsQRRef.current = window.jsQR;
-                }
+                // jsQRライブラリの読み込みを確認
+                const checkJsQR = () => {
+                    if (window.jsQR) {
+                        jsQRRef.current = window.jsQR;
+                        console.log('jsQR loaded successfully');
+                    } else {
+                        console.warn('jsQR not loaded yet');
+                    }
+                };
+                
+                // 即座にチェック
+                checkJsQR();
+                
+                // 1秒後にも再チェック
+                const timer = setTimeout(checkJsQR, 1000);
                 
                 // 製造ラインマスタを読み込む
                 loadMasterData();
+                
+                return () => clearTimeout(timer);
             }, []);
 
             // 製造場所コードが変更されたら製造ラインをフィルタリング
