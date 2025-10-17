@@ -8,10 +8,14 @@
   <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
   <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
   <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
-  <!-- jsQR は1本のみ -->
   <script src="https://unpkg.com/jsqr@1.4.0/dist/jsQR.js"></script>
   <!-- 製造ラインマスタ（同ディレクトリ） -->
   <script src="製造ラインマスタ.js"></script>
+  <style>
+    /* QR枠用のオーバーレイ */
+    .qr-canvas { position: absolute; inset: 0; pointer-events: none; }
+    .video-wrap { position: relative; }
+  </style>
 </head>
 <body>
   <div id="root"></div>
@@ -44,7 +48,7 @@
         <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path>
       </svg>
     );
-    const RefreshCw = ({ size=20 }) => (
+    const RefreshCw = ({ size=16 }) => (
       <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
         <polyline points="23 4 23 10 17 10"></polyline>
         <polyline points="1 20 1 14 7 14"></polyline>
@@ -69,29 +73,31 @@
       const [filteredLines, setFilteredLines] = useState([]);
       const [masterLoadError, setMasterLoadError] = useState('');
 
-      // スキャン関連
+      // スキャンUI
+      const [scanPanelOpen, setScanPanelOpen] = useState(false);
       const [isScanning, setIsScanning] = useState(false);
       const [scanError, setScanError] = useState('');
       const [scanInfo, setScanInfo] = useState('');
-      const videoRef = useRef(null);
-      const canvasRef = useRef(null);
-      const streamRef = useRef(null);
-      const jsQRRef = useRef(null);
 
-      // カメラ選択
       const [cameras, setCameras] = useState([]);
       const [selectedDeviceId, setSelectedDeviceId] = useState('');
+
+      const videoRef = useRef(null);
+      const canvasRef = useRef(null);        // デコード用キャンバス（非表示）
+      const overlayRef = useRef(null);       // 枠描画用キャンバス（表示）
+      const streamRef = useRef(null);
+      const jsQRRef = useRef(null);
+      const isScanningRef = useRef(false);   // ループ用・最新状態を保持
 
       const locationCodeOptions = ['M0HZ','M1HZ','M2HZ','M3HZ','M4HZ'];
 
       useEffect(() => {
+        // jsQR の参照を安定化
         if (window.jsQR) jsQRRef.current = window.jsQR;
         const t = setInterval(() => {
           if (!jsQRRef.current && window.jsQR) { jsQRRef.current = window.jsQR; clearInterval(t); }
-        }, 150);
-
+        }, 120);
         loadMasterData();
-        enumerateCameras();
         return () => clearInterval(t);
       }, []);
 
@@ -125,19 +131,6 @@
         }
       };
 
-      // カメラ列挙
-      const enumerateCameras = async () => {
-        try {
-          try { await navigator.mediaDevices.getUserMedia({ video: true, audio: false }); } catch(_){}
-          const devices = await navigator.mediaDevices.enumerateDevices();
-          const vids = devices.filter(d => d.kind === 'videoinput');
-          setCameras(vids);
-          if (vids.length > 0 && !selectedDeviceId) setSelectedDeviceId(vids[0].deviceId);
-        } catch(e) {
-          console.warn('カメラ列挙に失敗:', e);
-        }
-      };
-
       const handleInputChange = (field, value, process=null) => {
         if (process) {
           setCurrentRecord(prev => ({ ...prev, [process]: { ...prev[process], [field]: value } }));
@@ -158,113 +151,133 @@
         }
       };
 
-      // カメラ: 取得フォールバック
-      const getStreamWithFallbacks = async () => {
-        const tries = [];
-        if (selectedDeviceId) {
-          tries.push({ video: { deviceId: { exact: selectedDeviceId } } });
-          tries.push({ video: { deviceId: { exact: selectedDeviceId }, width: { ideal:1280 }, height:{ ideal:720 } } });
-        }
-        tries.push({ video: { facingMode: { ideal:'environment' } } });
-        tries.push({ video: { facingMode: { ideal:'environment' }, width:{ ideal:1280 }, height:{ ideal:720 } } });
-        tries.push({ video: true });
-
-        let lastErr = null;
-        for (const c of tries) {
-          try {
-            const s = await navigator.mediaDevices.getUserMedia({ ...c, audio:false });
-            setScanInfo('constraints: ' + JSON.stringify(c));
-            return s;
-          } catch (e) { lastErr = e; }
-        }
-        throw lastErr || new Error('カメラ取得に失敗');
-      };
-
-      const ensureVideoReady = (video, timeoutMs = 3000) => {
-        return new Promise((resolve, reject) => {
-          const start = Date.now();
-          const check = () => {
-            if (!video) return reject(new Error('video要素未初期化'));
-            const ok = video.readyState >= 2 && video.videoWidth > 0 && video.videoHeight > 0;
-            if (ok) return resolve();
-            if (Date.now() - start > timeoutMs) return reject(new Error('映像メタデータの取得にタイムアウト'));
-            requestAnimationFrame(check);
-          };
-          video.addEventListener('loadedmetadata', check, { once:true });
-          video.addEventListener('loadeddata', check, { once:true });
-          check();
-        });
-      };
-
-      const startQRScan = async () => {
-        if (!jsQRRef.current && window.jsQR) jsQRRef.current = window.jsQR;
-        if (!jsQRRef.current) { setScanError('QRコードスキャナーの読み込み中です...'); return; }
-
+      // ===== カメラUI（ボタン押下後だけ表示） =====
+      const openScanPanel = async () => {
         setScanError('');
         setScanInfo('');
-        try {
-          // 先にDOMへvideoを確実に出す
-          setIsScanning(true);
-          await new Promise(r => requestAnimationFrame(r));
+        setScanPanelOpen(true);
+        await enumerateCameras();
+      };
 
-          if (streamRef.current) {
-            streamRef.current.getTracks().forEach(t => t.stop());
-            streamRef.current = null;
-          }
-          const stream = await getStreamWithFallbacks();
+      const closeScanPanel = () => {
+        stopQRScan();
+        setScanPanelOpen(false);
+      };
+
+      const enumerateCameras = async () => {
+        try {
+          try { await navigator.mediaDevices.getUserMedia({ video: true, audio: false }); } catch(_) {}
+          const devices = await navigator.mediaDevices.enumerateDevices();
+          const vids = devices.filter(d => d.kind === 'videoinput');
+          setCameras(vids);
+          if (vids.length > 0 && !selectedDeviceId) setSelectedDeviceId(vids[0].deviceId);
+        } catch(e) {
+          console.warn('カメラ列挙に失敗:', e);
+        }
+      };
+
+      const beginScan = async () => {
+        if (!jsQRRef.current) { setScanError('QRコードスキャナーの読み込み中です...'); return; }
+        setScanError('');
+        try {
+          setIsScanning(true);
+          isScanningRef.current = true;
+          // DOM描画完了を待つ
+          await new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)));
+
+          const constraints = selectedDeviceId
+            ? { video: { deviceId: { exact: selectedDeviceId }, width:{ ideal:1280 }, height:{ ideal:720 } }, audio:false }
+            : { video: { facingMode:{ ideal:'environment' }, width:{ ideal:1280 }, height:{ ideal:720 } }, audio:false };
+
+          const stream = await navigator.mediaDevices.getUserMedia(constraints);
           streamRef.current = stream;
+          setScanInfo('constraints: ' + JSON.stringify(constraints.video));
 
           const v = videoRef.current;
           if (!v) throw new Error('video要素が見つかりません');
-
           v.srcObject = stream;
           v.setAttribute('playsinline', '');
           v.setAttribute('autoplay', '');
           v.muted = true;
 
           await v.play().catch(()=>{});
-          await ensureVideoReady(v, 3000);
+          await new Promise((resolve) => {
+            if (v.readyState >= 2 && v.videoWidth > 0) resolve();
+            v.onloadedmetadata = () => resolve();
+            v.onloadeddata = () => resolve();
+          });
 
-          scanQRCode();
+          // ループ開始
+          requestAnimationFrame(scanLoop);
         } catch (err) {
+          setIsScanning(false);
+          isScanningRef.current = false;
           if (err.name === 'NotAllowedError') setScanError('カメラへのアクセスが拒否されました。ブラウザの許可設定をご確認ください。');
           else if (err.name === 'NotFoundError') setScanError('カメラデバイスが見つかりません。外付けカメラの接続や権限をご確認ください。');
           else if (err.name === 'OverconstrainedError') setScanError('指定したカメラが利用できません。別のカメラを選択してください。');
           else setScanError('カメラの初期化に失敗しました: ' + err.message);
           console.error(err);
-          setIsScanning(false);
         }
       };
 
-      const scanQRCode = () => {
-        if (!videoRef.current || !canvasRef.current || !jsQRRef.current || !isScanning) return;
+      // ===== デコード・ループ（常に最新の状態参照: isScanningRef） =====
+      const drawLine = (ctx, begin, end) => {
+        ctx.beginPath();
+        ctx.moveTo(begin.x, begin.y);
+        ctx.lineTo(end.x, end.y);
+        ctx.lineWidth = 3;
+        ctx.strokeStyle = '#22c55e';
+        ctx.stroke();
+      };
 
-        const video = videoRef.current;
-        const canvas = canvasRef.current;
-        const ctx = canvas.getContext('2d');
+      const scanLoop = () => {
+        if (!isScanningRef.current) return;
+        const v = videoRef.current;
+        const c = canvasRef.current;
+        const overlay = overlayRef.current;
+        if (!v || !c) { requestAnimationFrame(scanLoop); return; }
 
-        const vw = video.videoWidth || 0;
-        const vh = video.videoHeight || 0;
+        const vw = v.videoWidth || 0;
+        const vh = v.videoHeight || 0;
         if (vw > 0 && vh > 0) {
+          const ctx = c.getContext('2d', { willReadFrequently: true });
           const maxSide = 720;
           const scale = Math.min(1, maxSide / Math.max(vw, vh));
-          canvas.width = Math.round(vw * scale);
-          canvas.height = Math.round(vh * scale);
+          c.width = Math.round(vw * scale);
+          c.height = Math.round(vh * scale);
+          // スムージングOFFでシャープに
+          ctx.imageSmoothingEnabled = false;
+          ctx.drawImage(v, 0, 0, c.width, c.height);
+          const img = ctx.getImageData(0, 0, c.width, c.height);
 
-          ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-          const img = ctx.getImageData(0, 0, canvas.width, canvas.height);
-          const code = jsQRRef.current(img.data, img.width, img.height, { inversionAttempts: 'dontInvert' });
+          const code = jsQRRef.current(img.data, img.width, img.height, { inversionAttempts: 'attemptBoth' });
+
+          // オーバーレイ描画
+          if (overlay) {
+            overlay.width = c.width;
+            overlay.height = c.height;
+            const octx = overlay.getContext('2d');
+            octx.clearRect(0, 0, overlay.width, overlay.height);
+            if (code && code.location) {
+              const loc = code.location;
+              drawLine(octx, loc.topLeftCorner, loc.topRightCorner);
+              drawLine(octx, loc.topRightCorner, loc.bottomRightCorner);
+              drawLine(octx, loc.bottomRightCorner, loc.bottomLeftCorner);
+              drawLine(octx, loc.bottomLeftCorner, loc.topLeftCorner);
+            }
+          }
 
           if (code && code.data) {
             handleInputChange('orderNumber', String(code.data));
-            stopQRScan();
+            closeScanPanel();
             return;
           }
         }
-        requestAnimationFrame(scanQRCode);
+        requestAnimationFrame(scanLoop);
       };
 
       const stopQRScan = () => {
+        isScanningRef.current = false;
         if (streamRef.current) {
           streamRef.current.getTracks().forEach(t => t.stop());
           streamRef.current = null;
@@ -272,6 +285,7 @@
         setIsScanning(false);
       };
 
+      // ===== バリデーション他 =====
       const validateTimeValue = (value, fieldName, process) => {
         const newErrors = {};
         if (value) {
@@ -313,11 +327,9 @@
 
       const addRecord = () => {
         if (!validateRecord()) return;
-
         const fillingRecord = { id: Date.now(), date: currentRecord.date, orderNumber: currentRecord.orderNumber, locationCode: currentRecord.locationCode, lineCode: currentRecord.lineCode, process: '充填', ...currentRecord.filling };
         const finishingRecord = { id: Date.now()+1, date: currentRecord.date, orderNumber: currentRecord.orderNumber, locationCode: currentRecord.locationCode, lineCode: currentRecord.lineCode, process: '仕上', ...currentRecord.finishing };
         setRecords(prev => [...prev, fillingRecord, finishingRecord]);
-
         setCurrentRecord({
           date: new Date().toISOString().split('T')[0],
           orderNumber: '',
@@ -367,36 +379,10 @@
                         : <p className="text-xs text-yellow-600">データがありません</p>)}
                   </div>
                   <button onClick={loadMasterData} className="px-4 py-2 bg-blue-500 text-white rounded-lg hover:bg-blue-600 text-sm flex items-center gap-2">
-                    <RefreshCw size={16}/> 製造ラインマスタ読込
+                    <RefreshCw /> 製造ラインマスタ読込
                   </button>
                 </div>
               </div>
-
-              {/* カメラ選択 */}
-              <div className="mb-6 p-4 bg-gray-50 border border-gray-200 rounded-lg">
-                <label className="block text-sm font-medium text-gray-700 mb-1">使用カメラ</label>
-                <div className="flex gap-2">
-                  <select value={selectedDeviceId} onChange={e => setSelectedDeviceId(e.target.value)} className="flex-1 px-3 py-2 border rounded-lg">
-                    {cameras.length === 0 && <option value="">（カメラが見つかりません）</option>}
-                    {cameras.map((c,i) => <option key={c.deviceId} value={c.deviceId}>{c.label || `カメラ ${i+1}`}</option>)}
-                  </select>
-                  <button onClick={enumerateCameras} className="px-4 py-2 bg-gray-700 text-white rounded-lg hover:bg-gray-800 text-sm">再検出</button>
-                </div>
-                <p className="text-xs text-gray-500 mt-1">※ 初回はブラウザのカメラ許可後にラベルが表示されます</p>
-              </div>
-
-              {/* スキャナビュー（video/canvasは常時DOMに置き、表示のみ切替） */}
-              <div className={`mb-6 p-4 bg-gray-50 rounded-lg ${isScanning ? '' : 'hidden'}`}>
-                <div className="flex justify-between items-center mb-3">
-                  <h3 className="font-semibold text-gray-700">QRコードをスキャン</h3>
-                  <button onClick={stopQRScan} className="px-3 py-1 bg-red-500 text-white rounded hover:bg-red-600 text-sm">キャンセル</button>
-                </div>
-                <video ref={videoRef} className="w-full rounded-lg bg-black object-contain" autoPlay muted playsInline />
-                <canvas ref={canvasRef} className="hidden" />
-                {scanInfo && <div className="text-xs text-gray-500 mt-2">使用制約: {scanInfo}</div>}
-              </div>
-
-              {scanError && <div className="mb-4 p-3 bg-red-100 text-red-700 rounded-lg text-sm">{scanError}</div>}
 
               {/* 共通項目 */}
               <div className="mb-6">
@@ -419,8 +405,8 @@
                           className={`w-full px-3 py-2 border rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 ${errors.orderNumber ? 'border-red-500':'border-gray-300'}`} />
                         {errors.orderNumber && <p className="text-red-500 text-xs mt-1">{errors.orderNumber}</p>}
                       </div>
-                      <button onClick={startQRScan} disabled={isScanning}
-                        className="px-4 py-2 bg-blue-500 text-white rounded-lg hover:bg-blue-600 disabled:bg-gray-400">
+                      <button onClick={openScanPanel}
+                        className="px-4 py-2 bg-blue-500 text-white rounded-lg hover:bg-blue-600">
                         <Camera size={20}/>
                       </button>
                     </div>
@@ -580,6 +566,52 @@
               </div>
             )}
           </div>
+
+          {/* === スキャンパネル === */}
+          {scanPanelOpen && (
+            <div className="fixed inset-0 bg-black/40 flex items-center justify-center z-50">
+              <div className="bg-white w-full max-w-2xl rounded-lg shadow-lg p-4">
+                <div className="flex items-center justify-between mb-3">
+                  <h3 className="font-semibold text-gray-800">QRコード読み取り</h3>
+                  <button onClick={closeScanPanel} className="px-3 py-1 bg-gray-600 text-white rounded hover:bg-gray-700 text-sm">閉じる</button>
+                </div>
+
+                {/* カメラ選択（開始前のみ） */}
+                {!isScanning && (
+                  <div className="mb-4">
+                    <label className="block text-sm font-medium text-gray-700 mb-1">使用カメラ</label>
+                    <div className="flex gap-2">
+                      <select value={selectedDeviceId} onChange={e => setSelectedDeviceId(e.target.value)} className="flex-1 px-3 py-2 border rounded-lg">
+                        {cameras.length === 0 && <option value="">（カメラが見つかりません）</option>}
+                        {cameras.map((c,i) => <option key={c.deviceId} value={c.deviceId}>{c.label || `カメラ ${i+1}`}</option>)}
+                      </select>
+                      <button onClick={enumerateCameras} className="px-3 py-2 bg-gray-700 text-white rounded hover:bg-gray-800 text-sm">再検出</button>
+                      <button onClick={beginScan} className="px-3 py-2 bg-blue-600 text-white rounded hover:bg-blue-700 text-sm">開始</button>
+                    </div>
+                    <p className="text-xs text-gray-500 mt-1">※ この画面を開いた後にブラウザがカメラ許可を求める場合があります。</p>
+                  </div>
+                )}
+
+                {/* スキャナビュー */}
+                {isScanning && (
+                  <div className="mb-2">
+                    <div className="flex justify-between items-center mb-2">
+                      <div className="text-sm text-gray-600">スキャン中… カメラにQRを映してください。</div>
+                      <button onClick={stopQRScan} className="px-3 py-1 bg-red-500 text-white rounded hover:bg-red-600 text-sm">停止</button>
+                    </div>
+                    <div className="video-wrap">
+                      <video ref={videoRef} className="w-full rounded-lg bg-black object-contain" autoPlay muted playsInline />
+                      <canvas ref={overlayRef} className="qr-canvas"></canvas>
+                    </div>
+                    <canvas ref={canvasRef} className="hidden" />
+                    {scanInfo && <div className="text-xs text-gray-500 mt-2">{scanInfo}</div>}
+                  </div>
+                )}
+
+                {scanError && <div className="p-2 bg-red-100 text-red-700 rounded text-sm">{scanError}</div>}
+              </div>
+            </div>
+          )}
         </div>
       );
     }
